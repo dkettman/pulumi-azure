@@ -1,0 +1,7 @@
+config:
+  azure-native:location: eastus
+  vm-quickstart:adminUsername: cs_admin
+  vm-quickstart:osImage: Debian:debian-11:11:latest
+  vm-quickstart:servicePort: "80"
+  vm-quickstart:vmName: my-server
+  vm-quickstart:vmSize: Standard_B1s
