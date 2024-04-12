@@ -1,46 +1,32 @@
 import pulumi
-from pulumi_azure_native import resources, network, compute
-from pulumi_random import random_string
-from pprint import pprint
 import pulumi_tls as tls
 import base64
 
+from pulumi_azure_native import resources, network, compute
+from pulumi_random import random_string
+from pprint import pprint
+from dataclasses import dataclass, field
+
+
 # Import the program's configuration settings
 config = pulumi.Config()
-lab_name = config.get("labName", "default")
 vm_size = config.get("vmSize", "Standard_B2s")
-os_image = config.get(
-    "osImage", "WindowsServer:MicrosoftWindowsServer:2019-Datacenter:latest"
-)
 admin_username = config.get("adminUsername", "cs_admin")
+admin_password = config.get("adminPassword", "Cyb3rS0lve!!")
 
-os_image_publisher, os_image_offer, os_image_sku, os_image_version = os_image.split(":")
-
-# Create an SSH key
-ssh_key = tls.PrivateKey(
-    "ssh-key",
-    algorithm="RSA",
-    rsa_bits=4096,
-)
+# os_image_publisher, os_image_offer, os_image_sku, os_image_version = os_image.split(":")
 
 # Get common lab resources
 resource_group = resources.get_resource_group("rg-cybersolve-labs")
 virtual_network = network.get_virtual_network(
-    resource_group_name=resource_group.name, virtual_network_name="vNet-CyberSolve-Labs"
+    resource_group_name=resource_group.name,
+    virtual_network_name="vNet-CyberSolve-Labs",
 )
 subnet = network.get_subnet(
     resource_group_name=resource_group.name,
     subnet_name="default",
     virtual_network_name=virtual_network.name,
 )
-
-
-def create_publicip(pip_name):
-    return network.PublicIPAddress(
-        pip_name,
-        public_ip_address_name=pip_name,
-        resource_group_name=resource_group.name,
-    )
 
 
 def create_networksecuritygroup(nsg_name):
@@ -63,118 +49,228 @@ def create_networksecuritygroup(nsg_name):
     )
 
 
-def create_network_interface(nic_name, nsg):
-    return network.NetworkInterface(
-        resource_name=nic_name,
-        network_interface_name=nic_name,
+def create_network_interface(svr_name, public_ip_required=False):
+    # Create a public IP address if required
+    public_ip = None
+    if public_ip_required:
+        public_ip = network.PublicIPAddress(
+            "pip-" + svr_name,
+            resource_group_name=resource_group.name,
+            sku=network.PublicIPAddressSkuArgs(
+                name="Basic",
+            ),
+            public_ip_allocation_method="Dynamic",
+        )
+        pulumi.export("-".join(["publicIP", svr_name]), public_ip.ip_address)
+
+    # Create a network interface
+    if dc_nic != None:
+        network_interface = network.NetworkInterface(
+            "nic-" + svr_name,
+            network_security_group=network.NetworkSecurityGroupArgs(id=nsg.id),
+            resource_group_name=resource_group.name,
+            dns_settings=network.NetworkInterfaceDnsSettingsArgs(
+                dns_servers=[
+                    dc_nic.ip_configurations[0].private_ip_address.apply(
+                        lambda private_ip_address: network.get_network_interface(
+                            network_interface_name=dc_nic.name,
+                            resource_group_name=resource_group.name,
+                        )
+                        .ip_configurations[0]
+                        .private_ip_address
+                    )
+                ]
+            ),
+            ip_configurations=[
+                network.NetworkInterfaceIPConfigurationArgs(
+                    name="ipconfig1",
+                    subnet=network.SubnetArgs(
+                        id=subnet.id,
+                    ),
+                    public_ip_address=(
+                        network.PublicIPAddressArgs(id=public_ip.id)
+                        if public_ip_required
+                        else None
+                    ),
+                    primary=True,
+                )
+            ],
+        )
+    else:
+        network_interface = network.NetworkInterface(
+            "nic-" + svr_name,
+            network_security_group=network.NetworkSecurityGroupArgs(id=nsg.id),
+            resource_group_name=resource_group.name,
+            ip_configurations=[
+                network.NetworkInterfaceIPConfigurationArgs(
+                    name="ipconfig1",
+                    subnet=network.SubnetArgs(
+                        id=subnet.id,
+                    ),
+                    public_ip_address=(
+                        network.PublicIPAddressArgs(id=public_ip.id)
+                        if public_ip_required
+                        else None
+                    ),
+                    primary=True,
+                )
+            ],
+        )
+
+    return network_interface
+
+
+def create_virtualmachine(vm_name, network_interface, os_image):
+    security_profile = None
+    match os_image:
+        case "Windows":
+            image = "MicrosoftWindowsServer:WindowsServer:2019-Datacenter:latest"
+        case "Ubuntu":
+            image = "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest"
+        case "RHEL":
+            image = "erockyenterprisesoftwarefoundationinc1653071250513:rockylinux-9:rockylinux-9:9.0.0"
+        case "DC":
+            image = "MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition:latest"
+
+    os_image_publisher, os_image_offer, os_image_sku, os_image_version = image.split(
+        ":"
+    )
+
+    if os_image == "Windows":
+        profile = compute.OSProfileArgs(
+            computer_name=vm_name,
+            admin_username=admin_username,
+            admin_password=admin_password,
+        )
+        storage_profile = compute.StorageProfileArgs(
+            os_disk=compute.OSDiskArgs(
+                name=f"{vm_name}-osdisk",
+                create_option=compute.DiskCreateOption.FROM_IMAGE,
+                delete_option=compute.DiskDeleteOptionTypes.DELETE,
+            ),
+            image_reference=compute.ImageReferenceArgs(
+                publisher=os_image_publisher,
+                offer=os_image_offer,
+                sku=os_image_sku,
+                version=os_image_version,
+            ),
+        )
+    elif os_image == "DC":
+        profile = None
+        storage_profile = compute.StorageProfileArgs(
+            os_disk=compute.OSDiskArgs(
+                name=f"{vm_name}-osdisk",
+                create_option=compute.DiskCreateOption.FROM_IMAGE,
+                delete_option=compute.DiskDeleteOptionTypes.DELETE,
+            ),
+            image_reference=compute.ImageReferenceArgs(
+                id="/subscriptions/c10368aa-7348-4c86-b047-33e52b5bd6c5/resourceGroups/rg-CyberSolve-Labs/providers/Microsoft.Compute/galleries/cs_vm_images/images/cs_dc_win2k22"
+            ),
+        )
+        security_profile = compute.SecurityProfileArgs(
+            security_type=compute.SecurityTypes.TRUSTED_LAUNCH
+        )
+    else:
+        profile = compute.OSProfileArgs(
+            computer_name=vm_name,
+            admin_username=admin_username,
+            admin_password=admin_password,
+        )
+        storage_profile = compute.StorageProfileArgs(
+            os_disk=compute.OSDiskArgs(
+                name=f"{vm_name}-osdisk",
+                create_option=compute.DiskCreateOption.FROM_IMAGE,
+                delete_option=compute.DiskDeleteOptionTypes.DELETE,
+            ),
+            image_reference=compute.ImageReferenceArgs(
+                publisher=os_image_publisher,
+                offer=os_image_offer,
+                sku=os_image_sku,
+                version=os_image_version,
+            ),
+        )
+
+    return compute.VirtualMachine(
+        "vm-" + vm_name,
+        vm_name="vm-" + vm_name,
         resource_group_name=resource_group.name,
-        network_security_group=nsg,
-        ip_configurations=[
-            network.NetworkInterfaceIPConfigurationArgs(
-                name="ipconfig1",
-                subnet=network.SubnetArgs(id=subnet.id)
-            )
-        ]
+        network_profile=compute.NetworkProfileArgs(
+            network_interfaces=[
+                compute.NetworkInterfaceReferenceArgs(
+                    id=network_interface.id,
+                    primary=True,
+                )
+            ]
+        ),
+        hardware_profile=compute.HardwareProfileArgs(
+            vm_size=vm_size,
+        ),
+        os_profile=profile,
+        storage_profile=storage_profile,
+        security_profile=security_profile or None,
     )
 
 
-mynsg = create_networksecuritygroup("mynsg")
-# nsg = network.get_network_security_group(
-#     network_security_group_name=mynsg, resource_group_name=resource_group
-# )
-nic = create_network_interface("mynic", mynsg)
+nsg = create_networksecuritygroup("nsg-" + pulumi.get_stack())
 
-# # Create a network interface with the virtual network, IP address, and security group
-# network_interface = network.NetworkInterface(
-#     "network-interface",
-#     resource_group_name=resource_group.name,
-#     network_security_group=network.NetworkSecurityGroupArgs(
-#         id=security_group.id,
-#     ),
-#     ip_configurations=[
-#         network.NetworkInterfaceIPConfigurationArgs(
-#             name=f"{vm_name}-ipconfiguration",
-#             private_ip_allocation_method=network.IpAllocationMethod.DYNAMIC,
-#             subnet=network.SubnetArgs(
-#                 id=virtual_network.subnets.apply(lambda subnets: subnets[0].id),
-#             ),
-#             public_ip_address=network.PublicIPAddressArgs(
-#                 id=public_ip.id,
-#             ),
-#         ),
-#     ],
-# )
+# Build the DC (Required for all labs)
+dc_nic = None
+dc_nic = create_network_interface(pulumi.get_stack() + "-dc", False)
+dc_vm = create_virtualmachine(pulumi.get_stack() + "-dc", dc_nic, "DC")
 
-# # Define a script to be run when the VM starts up
-# init_script = f"""#!/bin/bash
-#     echo '<!DOCTYPE html>
-#     <html lang="en">
-#     <head>
-#         <meta charset="utf-8">
-#         <title>Hello, world!</title>
-#     </head>
-#     <body>
-#         <h1>Hello, world! 👋</h1>
-#         <p>Deployed with 💜 by <a href="https://pulumi.com/">Pulumi</a>.</p>
-#     </body>
-#     </html>' > index.html
-#     sudo python3 -m http.server {service_port} &
-#     """
+servers_to_build = [
+    {
+        "vm_name": "app",
+        "pip": True,
+        "os": "Windows",
+    },
+    {
+        "vm_name": "lin1",
+        "pip": False,
+        "os": "Ubuntu",
+    },
+    {
+        "vm_name": "lin2",
+        "pip": False,
+        "os": "Ubuntu",
+    },
+]
 
-# # Create the virtual machine
-# vm = compute.VirtualMachine(
-#     "vm",
-#     resource_group_name=resource_group.name,
-#     network_profile=compute.NetworkProfileArgs(
-#         network_interfaces=[
-#             compute.NetworkInterfaceReferenceArgs(
-#                 id=network_interface.id,
-#                 primary=True,
-#             )
-#         ]
-#     ),
-#     hardware_profile=compute.HardwareProfileArgs(
-#         vm_size=vm_size,
-#     ),
-#     os_profile=compute.OSProfileArgs(
-#         computer_name=vm_name,
-#         admin_username=admin_username,
-#         custom_data=base64.b64encode(bytes(init_script, "utf-8")).decode("utf-8"),
-#         linux_configuration=compute.LinuxConfigurationArgs(
-#             disable_password_authentication=True,
-#             ssh=compute.SshConfigurationArgs(
-#                 public_keys=[
-#                     compute.SshPublicKeyArgs(
-#                         key_data=ssh_key.public_key_openssh,
-#                         path=f"/home/{admin_username}/.ssh/authorized_keys",
-#                     ),
-#                 ],
-#             ),
-#         ),
-#     ),
-#     storage_profile=compute.StorageProfileArgs(
-#         os_disk=compute.OSDiskArgs(
-#             name=f"{vm_name}-osdisk",
-#             create_option=compute.DiskCreateOption.FROM_IMAGE,
-#         ),
-#         image_reference=compute.ImageReferenceArgs(
-#             publisher=os_image_publisher,
-#             offer=os_image_offer,
-#             sku=os_image_sku,
-#             version=os_image_version,
-#         ),
-#     ),
-# )
+for svr in servers_to_build:
+    svr_name = pulumi.get_stack() + "-" + svr["vm_name"]
+    nic = create_network_interface(svr_name, svr["pip"])
+    vm = create_virtualmachine(svr_name, nic, svr["os"])
 
-# # Once the machine is created, fetch its IP address and DNS hostname
-# vm_address = vm.id.apply(
-#     lambda id: network.get_public_ip_address_output(
-#         resource_group_name=resource_group.name,
-#         public_ip_address_name=public_ip.name,
-#     )
-# )
+    if svr["os"] == "Windows":
+        vm_ext = compute.VirtualMachineExtension(
+            "vm_ext-" + svr_name,
+            publisher="Microsoft.Compute",
+            type="JsonADDomainExtension",
+            type_handler_version="1.3",
+            settings={
+                "Name": "cybersolve.lab",
+                "User": "cybersolve\\cs_admin",
+                "domainJoinUserName": "cybersolve\\cs_admin",
+                "domainFQDN": "cybersolve.lab",
+                "Restart": "true",
+            },
+            protected_settings={
+                "Password": "CyberS0lve!!",
+                "domainJoinUserPassword": "Cyb3rS0lve!!",
+            },
+            vm_name=vm.name,
+            resource_group_name=resource_group.name,
+            vm_extension_name="MyCustomScriptExtension",
+            opts=pulumi.ResourceOptions(
+                depends_on=[
+                    vm,
+                    dc_vm,
+                ]
+            ),
+        )
 
-# Export the VM's hostname, public IP address, HTTP URL, and SSH private key
-pulumi.export("resourceGroup", resource_group.name)
-pulumi.export("virtualNetwork", virtual_network.name)
-pulumi.export("subnet", subnet.name)
+    pulumi.export(
+        "Private IP (" + svr["vm_name"] + ")",
+        nic.ip_configurations[0].private_ip_address,
+    )
+    pulumi.export("Username", admin_username)
